@@ -1,6 +1,6 @@
 {
-  "name": "Remix QR School Bus Scanner",
-  "description": "ระบบสแกนคิวอาร์โค้ดขึ้นรถโรงเรียน สไตล์ iOS App พร้อมระบบจัดการหลังบ้าน และเชื่อมต่อ Google Sheets",
+  "name": "QR School Bus Scanner",
+  "description": "ระบบสแกนคิวอาร์โค้ดขึ้นรถโรงเรียน สไตล์ iOS App พร้อมระบบจัดการหลังบ้าน เชื่อมต่อ Supabase PostgreSQL (100% Real Cloud Data) และ Google Sheets",
   "requestFramePermissions": [
     "camera",
     "geolocation"

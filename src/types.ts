@@ -28,6 +28,7 @@ export interface Student {
 export interface Car {
   carID: string;
   plate: string;
+  plateNumber?: string;
   name: string;
   route: string;
   driver: string;

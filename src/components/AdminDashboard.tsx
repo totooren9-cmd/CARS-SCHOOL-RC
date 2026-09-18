@@ -23,11 +23,15 @@ import {
   Clock,
   Car as CarIcon,
   AlertTriangle,
+  Download,
+  Upload,
 } from 'lucide-react';
 import { Student, ScanRecord, Car, AdminTab } from '../types';
 import { GoogleSheetsPanel } from './GoogleSheetsPanel';
 import { SupabasePanel } from './SupabasePanel';
 import { isSupabaseConnected } from '../services/supabaseClient';
+import { StudentExcelModal } from './StudentExcelModal';
+import { exportStudentTemplateXLSX, exportStudentsToXLSX, exportScansToXLSX } from '../utils/excelStudents';
 
 interface AdminDashboardProps {
   students: Student[];
@@ -36,6 +40,7 @@ interface AdminDashboardProps {
   onAddStudent: (student: Student) => Promise<boolean | void> | void;
   onEditStudent?: (student: Student) => Promise<boolean | void> | void;
   onDeleteStudent: (id: string) => Promise<boolean | void> | void;
+  onImportStudents?: (students: Student[]) => Promise<boolean | void> | void;
   onAddCar?: (car: Car) => Promise<boolean | void> | void;
   onEditCar?: (car: Car) => Promise<boolean | void> | void;
   onDeleteCar?: (carId: string) => Promise<boolean | void> | void;
@@ -81,8 +86,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   isSyncingSheets = false,
   onSyncFromSupabase,
   isSyncingSupabase = false,
+  onImportStudents,
 }) => {
   const [activeTab, setActiveTab] = useState<AdminTab>('dashboard');
+
+  // Excel Modal State
+  const [showExcelModal, setShowExcelModal] = useState(false);
 
   // Student Filter state
   const [stuSearch, setStuSearch] = useState('');
@@ -135,6 +144,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     new Date().toISOString().split('T')[0]
   );
   const [reportCar, setReportCar] = useState('');
+  const [reportScanType, setReportScanType] = useState<'all' | 'ขึ้นรถ' | 'ลงรถ'>('all');
+  const [reportSearch, setReportSearch] = useState('');
 
   // Confirm delete dialog state
   const [deleteConfirmItem, setDeleteConfirmItem] = useState<{
@@ -334,38 +345,140 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setGeneratedQRs(results);
   };
 
-  // Export Excel CSV
-  const exportExcel = () => {
+  // Helper: Date Matching for Reports
+  const isScanDateMatching = (scan: ScanRecord, targetDateYMD: string): boolean => {
+    if (!targetDateYMD) return true;
+
+    // 1. Check timestamp
+    if (scan.timestamp) {
+      const d = new Date(scan.timestamp);
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      if (`${y}-${m}-${day}` === targetDateYMD) return true;
+    }
+
+    // 2. Exact match in dateThai
+    if (scan.dateThai && scan.dateThai.includes(targetDateYMD)) return true;
+
+    // 3. Thai date matching (e.g. "18 ก.ย. 2569")
+    if (scan.dateThai) {
+      const parts = targetDateYMD.split('-');
+      if (parts.length === 3) {
+        const [yearStr, monthStr, dayStr] = parts;
+        const thaiYear = String(Number(yearStr) + 543);
+        const thaiMonths = [
+          'ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.',
+          'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.',
+        ];
+        const thaiMonth = thaiMonths[Number(monthStr) - 1];
+        const dayNum = String(Number(dayStr));
+
+        if (thaiMonth && scan.dateThai.includes(thaiMonth) && scan.dateThai.includes(thaiYear)) {
+          const matchPattern = new RegExp(`(^|\\s)0?${dayNum}(\\s|$)`);
+          if (
+            matchPattern.test(scan.dateThai) ||
+            scan.dateThai.startsWith(`${dayNum} `) ||
+            scan.dateThai.startsWith(`${dayStr} `)
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+
+  // Helper: Car Matching for Reports (ตาม รถแต่ละสาย)
+  const isScanCarMatching = (scan: ScanRecord, targetCar: string): boolean => {
+    if (!targetCar) return true;
+    const target = targetCar.toLowerCase().trim();
+    const scanCarId = (scan.carID || '').toLowerCase().trim();
+    const scanBusNum = (scan.busNumber || '').toLowerCase().trim();
+
+    if (scanCarId === target || scanBusNum === target) return true;
+
+    const matchedCar = cars.find((c) => c.carID.toLowerCase() === target || c.name.toLowerCase() === target);
+    if (matchedCar) {
+      const carId = matchedCar.carID.toLowerCase();
+      const carName = matchedCar.name.toLowerCase();
+      const carPlate = (matchedCar.plate || matchedCar.plateNumber || '').toLowerCase();
+      if (
+        scanCarId === carId ||
+        scanBusNum === carId ||
+        scanBusNum.includes(carName) ||
+        (carPlate && scanBusNum.includes(carPlate))
+      ) {
+        return true;
+      }
+    }
+
+    return scanCarId.includes(target) || scanBusNum.includes(target);
+  };
+
+  // Filtered Scans for Reports tab (กรองตามวันที่, รถแต่ละสาย, ประเภทสแกน, ค้นหา)
+  const filteredScans = scans.filter((s) => {
+    if (!isScanDateMatching(s, reportDate)) return false;
+    if (!isScanCarMatching(s, reportCar)) return false;
+    if (reportScanType !== 'all') {
+      const type = s.scanType || 'ขึ้นรถ';
+      if (type !== reportScanType) return false;
+    }
+    if (reportSearch.trim()) {
+      const q = reportSearch.toLowerCase().trim();
+      const match =
+        s.name.toLowerCase().includes(q) ||
+        s.studentCode.toLowerCase().includes(q) ||
+        s.locationName.toLowerCase().includes(q) ||
+        (s.dorm && s.dorm.toLowerCase().includes(q));
+      if (!match) return false;
+    }
+    return true;
+  });
+
+  // Export Filtered Scans to XLSX (Excel)
+  const handleExportXLSX = () => {
+    const dateLabel = reportDate || 'ทุกวัน';
+    const carLabel = reportCar || 'ทุกสายรถ';
+    exportScansToXLSX(filteredScans, `รายงานสแกน_${dateLabel}_${carLabel}.xlsx`);
+  };
+
+  // Export Filtered Scans to CSV (UTF-8 BOM)
+  const handleExportCSV = () => {
     const headers = [
+      'ลำดับ',
       'ScanID',
-      'StudentCode',
-      'Name',
-      'Grade',
-      'CarID',
-      'BusNumber',
-      'Location',
-      'Latitude',
-      'Longitude',
-      'Date',
-      'Time',
-      'ScanType',
-      'Status',
+      'รหัสนักเรียน',
+      'ชื่อ-นามสกุล',
+      'ระดับชั้น',
+      'รหัสรถ',
+      'สายรถ',
+      'จุดสแกน',
+      'ละติจูด',
+      'ลองจิจูด',
+      'วันที่',
+      'เวลา',
+      'ประเภทสแกน',
+      'สถานะ',
+      'ผู้บันทึก',
     ];
 
-    const rows = scans.map((s) => [
+    const rows = filteredScans.map((s, idx) => [
+      idx + 1,
       s.scanId || s.id,
       s.studentCode,
       `"${s.name}"`,
-      s.grade,
+      s.grade || '',
       s.carID || '',
       `"${s.busNumber}"`,
-      `"${s.locationName}"`,
-      s.latitude,
-      s.longitude,
-      s.dateThai,
-      s.timeThai,
+      `"${s.locationName || s.dorm || ''}"`,
+      s.latitude ?? '',
+      s.longitude ?? '',
+      `"${s.dateThai || ''}"`,
+      `"${s.timeThai || ''}"`,
       s.scanType || 'ขึ้นรถ',
       'สำเร็จ',
+      `"${s.scannerName || 'เจ้าหน้าที่'}"`,
     ]);
 
     const csvContent =
@@ -374,7 +487,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.setAttribute('download', `รายงานสแกนรถ_Supabase_${Date.now()}.csv`);
+    const dateLabel = reportDate || 'ทุกวัน';
+    link.setAttribute('download', `รายงานสแกน_${dateLabel}_${reportCar || 'ทุกสายรถ'}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -805,9 +919,47 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </select>
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                {/* Excel Import Button */}
                 <button
                   type="button"
+                  id="btnImportExcel"
+                  className="px-3.5 py-2 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 hover:text-emerald-200 border border-emerald-500/30 font-semibold text-xs flex items-center gap-1.5 shadow-sm transition-all active:scale-95"
+                  onClick={() => setShowExcelModal(true)}
+                  title="นำเข้าไฟล์ Excel นักเรียน"
+                >
+                  <Upload className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>นำเข้า Excel</span>
+                </button>
+
+                {/* Export Template Button */}
+                <button
+                  type="button"
+                  id="btnExportTemplate"
+                  className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-white/10 font-semibold text-xs flex items-center gap-1.5 transition-all active:scale-95"
+                  onClick={exportStudentTemplateXLSX}
+                  title="ดาวน์โหลดไฟล์แม่แบบ Excel สำหรับกรอกข้อมูล"
+                >
+                  <Download className="w-3.5 h-3.5 text-amber-400" />
+                  <span>แม่แบบ Excel (Template)</span>
+                </button>
+
+                {/* Export Current Students */}
+                <button
+                  type="button"
+                  id="btnExportStudents"
+                  className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-white/10 font-medium text-xs flex items-center gap-1.5 transition-all active:scale-95"
+                  onClick={() => exportStudentsToXLSX(students)}
+                  title="ส่งออกรายชื่อนักเรียนทั้งหมดเป็น Excel"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>ส่งออก Excel</span>
+                </button>
+
+                {/* Add Single Student */}
+                <button
+                  type="button"
+                  id="btnAddStudent"
                   className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white font-semibold text-xs flex items-center gap-1.5 shadow-md transition-all"
                   onClick={() => {
                     resetStudentForm();
@@ -1114,106 +1266,359 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         )}
 
         {/* ======================================================== */}
-        {/* TAB 5: REPORTS */}
+        {/* TAB 5: REPORTS (กรองตามวันที่, กรองตามรถแต่ละสาย, นำออก Excel) */}
         {/* ======================================================== */}
         {activeTab === 'reports' && (
           <div className="space-y-4" id="tab-reports">
-            <div className="flex flex-wrap gap-2 items-center justify-between bg-slate-900 p-3 rounded-2xl border border-white/10">
-              <div className="flex flex-wrap items-center gap-2">
-                <input
-                  type="date"
-                  id="reportDate"
-                  className="bg-slate-800 border border-white/10 rounded-xl px-3 py-2 text-xs text-white"
-                  value={reportDate}
-                  onChange={(e) => setReportDate(e.target.value)}
-                />
-                <select
-                  id="reportCar"
-                  className="bg-slate-800 border border-white/10 rounded-xl px-3 py-2 text-xs text-white"
-                  value={reportCar}
-                  onChange={(e) => setReportCar(e.target.value)}
-                >
-                  <option value="">ทุกสายรถ</option>
-                  {allBuses.map((b) => (
-                    <option key={b} value={b}>
-                      {b}
-                    </option>
-                  ))}
-                </select>
+            {/* Filter Controls Bar */}
+            <div className="bg-slate-900 p-4 rounded-2xl border border-white/10 shadow-sm space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <FileSpreadsheet className="w-5 h-5 text-emerald-400" />
+                  <h3 className="text-sm font-bold text-white">รายงานสรุปการสแกนและตัวกรอง</h3>
+                </div>
+
+                {/* Export Buttons */}
+                <div className="flex items-center gap-2">
+                  <button
+                    className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs flex items-center gap-1.5 shadow transition-colors"
+                    type="button"
+                    onClick={handleExportXLSX}
+                    title="ดาวน์โหลดไฟล์ Excel .xlsx"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>ดาวน์โหลด Excel (.xlsx)</span>
+                  </button>
+                  <button
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-medium text-xs flex items-center gap-1.5 transition-colors"
+                    type="button"
+                    onClick={handleExportCSV}
+                    title="ดาวน์โหลดไฟล์ CSV (UTF-8)"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5 text-slate-400" />
+                    <span>CSV</span>
+                  </button>
+                </div>
               </div>
 
-              <button
-                className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs flex items-center gap-1.5 shadow"
-                type="button"
-                onClick={exportExcel}
-              >
-                <FileSpreadsheet className="w-3.5 h-3.5" />
-                <span>ดาวน์โหลด Excel CSV</span>
-              </button>
+              {/* Filters Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 pt-1">
+                {/* 1. Date Filter */}
+                <div className="space-y-1">
+                  <label className="text-[11px] text-slate-400 font-medium flex items-center gap-1">
+                    <Calendar className="w-3 h-3 text-emerald-400" />
+                    <span>กรองตามวันที่</span>
+                  </label>
+                  <div className="flex items-center gap-1">
+                    <input
+                      type="date"
+                      id="reportDate"
+                      className="bg-slate-800 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white w-full focus:outline-none focus:border-emerald-500"
+                      value={reportDate}
+                      onChange={(e) => setReportDate(e.target.value)}
+                    />
+                    {reportDate && (
+                      <button
+                        type="button"
+                        onClick={() => setReportDate('')}
+                        className="px-2 py-1.5 text-[11px] rounded-xl bg-slate-800 text-slate-400 hover:text-white border border-white/10 whitespace-nowrap"
+                        title="ดูทุกวัน"
+                      >
+                        ทุกวัน
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* 2. Car Filter (กรองตามรถแต่ละสาย) */}
+                <div className="space-y-1">
+                  <label className="text-[11px] text-slate-400 font-medium flex items-center gap-1">
+                    <Bus className="w-3 h-3 text-amber-400" />
+                    <span>กรองตามรถแต่ละสาย</span>
+                  </label>
+                  <select
+                    id="reportCar"
+                    className="bg-slate-800 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white w-full focus:outline-none focus:border-amber-500"
+                    value={reportCar}
+                    onChange={(e) => setReportCar(e.target.value)}
+                  >
+                    <option value="">ทุกสายรถ (ทั้งหมด {cars.length > 0 ? cars.length : allBuses.length} สาย)</option>
+                    {cars.length > 0
+                      ? cars.map((c) => (
+                          <option key={c.carID} value={c.carID}>
+                            {c.carID} - {c.name} ({c.plateNumber || 'ไม่ระบุทะเบียน'})
+                          </option>
+                        ))
+                      : allBuses.map((b) => (
+                          <option key={b} value={b}>
+                            สายรถ {b}
+                          </option>
+                        ))}
+                  </select>
+                </div>
+
+                {/* 3. Scan Type Filter */}
+                <div className="space-y-1">
+                  <label className="text-[11px] text-slate-400 font-medium flex items-center gap-1">
+                    <Layers className="w-3 h-3 text-sky-400" />
+                    <span>ประเภทการสแกน</span>
+                  </label>
+                  <select
+                    id="reportScanType"
+                    className="bg-slate-800 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white w-full focus:outline-none focus:border-sky-500"
+                    value={reportScanType}
+                    onChange={(e) => setReportScanType(e.target.value as 'all' | 'ขึ้นรถ' | 'ลงรถ')}
+                  >
+                    <option value="all">ทั้งหมด (ขึ้นรถ และ ลงรถ)</option>
+                    <option value="ขึ้นรถ">เฉพาะขึ้นรถ</option>
+                    <option value="ลงรถ">เฉพาะลงรถ</option>
+                  </select>
+                </div>
+
+                {/* 4. Search Filter */}
+                <div className="space-y-1">
+                  <label className="text-[11px] text-slate-400 font-medium flex items-center gap-1">
+                    <Search className="w-3 h-3 text-purple-400" />
+                    <span>ค้นหานักเรียน / จุดสแกน</span>
+                  </label>
+                  <div className="relative">
+                    <input
+                      type="text"
+                      placeholder="พิมพ์ชื่อ, รหัสนักเรียน, หรือจุดรับส่ง..."
+                      className="bg-slate-800 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white w-full pr-7 focus:outline-none focus:border-purple-500"
+                      value={reportSearch}
+                      onChange={(e) => setReportSearch(e.target.value)}
+                    />
+                    {reportSearch && (
+                      <button
+                        type="button"
+                        onClick={() => setReportSearch('')}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Quick Date Presets and Filter Status */}
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-white/5 text-xs">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-slate-400 text-[11px]">เลือกด่วน:</span>
+                  <button
+                    type="button"
+                    onClick={() => setReportDate(new Date().toISOString().split('T')[0])}
+                    className={`px-2 py-0.5 rounded-lg text-[11px] transition-colors ${
+                      reportDate === new Date().toISOString().split('T')[0]
+                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                        : 'bg-slate-800 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    วันนี้
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const d = new Date();
+                      d.setDate(d.getDate() - 1);
+                      setReportDate(d.toISOString().split('T')[0]);
+                    }}
+                    className="px-2 py-0.5 rounded-lg text-[11px] bg-slate-800 text-slate-400 hover:text-white transition-colors"
+                  >
+                    เมื่อวาน
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setReportDate('')}
+                    className={`px-2 py-0.5 rounded-lg text-[11px] transition-colors ${
+                      !reportDate
+                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                        : 'bg-slate-800 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    ทุกวัน
+                  </button>
+                </div>
+
+                {(reportDate || reportCar || reportScanType !== 'all' || reportSearch) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReportDate('');
+                      setReportCar('');
+                      setReportScanType('all');
+                      setReportSearch('');
+                    }}
+                    className="text-[11px] text-amber-400 hover:text-amber-300 flex items-center gap-1"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    <span>ล้างตัวกรองทั้งหมด</span>
+                  </button>
+                )}
+              </div>
             </div>
 
-            {/* Scans List Table */}
-            <div className="bg-slate-900 border border-white/10 rounded-2xl p-4 shadow-sm">
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-sm font-bold text-white">ประวัติการสแกนทั้งหมด ({scans.length} รายการ)</h3>
+            {/* Filter Metrics Summary */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+              <div className="bg-slate-900 border border-white/10 rounded-xl p-3">
+                <div className="text-[11px] text-slate-400">รายการตรงตามตัวกรอง</div>
+                <div className="text-xl font-bold text-white mt-0.5 flex items-baseline gap-1">
+                  <span>{filteredScans.length}</span>
+                  <span className="text-[11px] font-normal text-slate-500">/ {scans.length} ทั้งหมด</span>
+                </div>
               </div>
 
-              <div className="overflow-x-auto max-h-[500px]">
+              <div className="bg-slate-900 border border-white/10 rounded-xl p-3">
+                <div className="text-[11px] text-emerald-400">จำนวนขึ้นรถ</div>
+                <div className="text-xl font-bold text-emerald-400 mt-0.5">
+                  {filteredScans.filter((s) => (s.scanType || 'ขึ้นรถ') === 'ขึ้นรถ').length}
+                </div>
+              </div>
+
+              <div className="bg-slate-900 border border-white/10 rounded-xl p-3">
+                <div className="text-[11px] text-sky-400">จำนวนลงรถ</div>
+                <div className="text-xl font-bold text-sky-400 mt-0.5">
+                  {filteredScans.filter((s) => s.scanType === 'ลงรถ').length}
+                </div>
+              </div>
+
+              <div className="bg-slate-900 border border-white/10 rounded-xl p-3">
+                <div className="text-[11px] text-amber-400">สายรถที่เลือก</div>
+                <div className="text-xs font-semibold text-white mt-1 truncate">
+                  {reportCar ? reportCar : 'ทุกสายรถ'}
+                </div>
+              </div>
+            </div>
+
+            {/* Filtered Scans List Table */}
+            <div className="bg-slate-900 border border-white/10 rounded-2xl p-4 shadow-sm">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                  <span>ผลลัพธ์รายการสแกน ({filteredScans.length} รายการ)</span>
+                  {reportDate && (
+                    <span className="text-[11px] px-2 py-0.5 bg-emerald-500/20 text-emerald-300 rounded-md font-normal">
+                      วันที่: {reportDate}
+                    </span>
+                  )}
+                  {reportCar && (
+                    <span className="text-[11px] px-2 py-0.5 bg-amber-500/20 text-amber-300 rounded-md font-normal">
+                      สาย: {reportCar}
+                    </span>
+                  )}
+                </h3>
+              </div>
+
+              <div className="overflow-x-auto max-h-[520px]">
                 <table className="table w-full text-xs text-left" id="reportStuTable">
                   <thead className="sticky top-0 bg-slate-900 z-10">
                     <tr className="border-b border-white/10 text-slate-400">
-                      <th className="py-2.5">เวลา</th>
+                      <th className="py-2.5">วันที่ / เวลา</th>
                       <th>รหัส</th>
                       <th>ชื่อ-สกุล</th>
                       <th>สายรถ</th>
                       <th>จุดสแกน</th>
                       <th>พิกัด GPS</th>
-                      <th>สถานะ</th>
+                      <th>ประเภทสแกน</th>
                       <th className="text-right">จัดการ</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {scans.length === 0 ? (
+                    {filteredScans.length === 0 ? (
                       <tr>
-                        <td colSpan={8} className="text-center py-8 text-slate-500">
-                          ยังไม่มีข้อมูลการสแกน
+                        <td colSpan={8} className="text-center py-10 text-slate-400">
+                          <div className="space-y-2">
+                            <p className="text-sm">ไม่พบข้อมูลการสแกนตามตัวกรองที่เลือก</p>
+                            <p className="text-xs text-slate-500">
+                              ลองเปลี่ยนวันที่ เลือกรถสายอื่น หรือกด "ล้างตัวกรองทั้งหมด"
+                            </p>
+                            {(reportDate || reportCar || reportScanType !== 'all' || reportSearch) && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setReportDate('');
+                                  setReportCar('');
+                                  setReportScanType('all');
+                                  setReportSearch('');
+                                }}
+                                className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-400 text-xs inline-block"
+                              >
+                                ล้างตัวกรองเพื่อดูทั้งหมด
+                              </button>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     ) : (
-                      scans.map((s, index) => (
-                        <tr key={`admin-all-scan-${s.id || s.scanId || 'item'}-${index}`} className="border-b border-white/5 hover:bg-white/5 text-slate-200">
-                          <td className="py-2 font-mono text-emerald-400">{s.timeThai}</td>
-                          <td className="font-mono text-amber-400">{s.studentCode}</td>
-                          <td className="font-semibold text-white">{s.name}</td>
-                          <td>{s.busNumber || s.carID}</td>
-                          <td className="text-slate-400">{s.locationName}</td>
-                          <td className="text-[10px] font-mono text-slate-400">
-                            {s.latitude ? `${s.latitude.toFixed(4)}, ${s.longitude.toFixed(4)}` : '-'}
-                          </td>
-                          <td>
-                            <span className="px-2 py-0.5 rounded-full text-[10px] bg-emerald-500/20 text-emerald-300">
-                              ขึ้นรถแล้ว
-                            </span>
-                          </td>
-                          <td className="text-right">
-                            {onDeleteScan && (
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setDeleteConfirmItem({
-                                    type: 'scan',
-                                    id: s.scanId || s.id,
-                                    name: `สแกนของ ${s.name}`,
-                                  })
-                                }
-                                className="p-1 rounded bg-rose-950/50 hover:bg-rose-900/60 text-rose-300 transition-colors"
+                      filteredScans.map((s, index) => {
+                        const isDrop = s.scanType === 'ลงรถ';
+                        return (
+                          <tr
+                            key={`admin-all-scan-${s.id || s.scanId || 'item'}-${index}`}
+                            className="border-b border-white/5 hover:bg-white/5 text-slate-200 transition-colors"
+                          >
+                            <td className="py-2 font-mono">
+                              <span className="text-emerald-400 block">{s.timeThai}</span>
+                              <span className="text-[10px] text-slate-500 block">{s.dateThai}</span>
+                            </td>
+                            <td className="font-mono text-amber-400 font-semibold">{s.studentCode}</td>
+                            <td className="font-semibold text-white">
+                              <div>{s.name}</div>
+                              {s.grade && <span className="text-[10px] text-slate-400">{s.grade}</span>}
+                            </td>
+                            <td>
+                              <span className="px-2 py-0.5 rounded-md text-[10px] bg-slate-800 border border-white/10 text-slate-300 font-mono">
+                                {s.busNumber || s.carID || 'CAR01'}
+                              </span>
+                            </td>
+                            <td className="text-slate-300">{s.locationName || s.dorm || '-'}</td>
+                            <td className="text-[10px] font-mono text-slate-400">
+                              {s.latitude && s.longitude ? (
+                                <a
+                                  href={`https://www.google.com/maps?q=${s.latitude},${s.longitude}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="hover:text-emerald-400 underline"
+                                  title="เปิดใน Google Maps"
+                                >
+                                  {s.latitude.toFixed(4)}, {s.longitude.toFixed(4)}
+                                </a>
+                              ) : (
+                                '-'
+                              )}
+                            </td>
+                            <td>
+                              <span
+                                className={`px-2 py-0.5 rounded-full text-[10px] font-medium ${
+                                  isDrop
+                                    ? 'bg-sky-500/20 text-sky-300 border border-sky-500/30'
+                                    : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                }`}
                               >
-                                <Trash2 className="w-3 h-3" />
-                              </button>
-                            )}
-                          </td>
-                        </tr>
-                      ))
+                                {isDrop ? 'ลงรถแล้ว' : 'ขึ้นรถแล้ว'}
+                              </span>
+                            </td>
+                            <td className="text-right">
+                              {onDeleteScan && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setDeleteConfirmItem({
+                                      type: 'scan',
+                                      id: s.scanId || s.id,
+                                      name: `สแกนของ ${s.name}`,
+                                    })
+                                  }
+                                  className="p-1.5 rounded-lg bg-rose-950/50 hover:bg-rose-900/60 text-rose-300 transition-colors"
+                                  title="ลบรายการสแกนนี้"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })
                     )}
                   </tbody>
                 </table>
@@ -1653,6 +2058,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
         </div>
       )}
+
+      {/* ======================================================== */}
+      {/* MODAL: EXCEL IMPORT & EXPORT TEMPLATE */}
+      {/* ======================================================== */}
+      <StudentExcelModal
+        isOpen={showExcelModal}
+        onClose={() => setShowExcelModal(false)}
+        currentStudents={students}
+        onImportStudents={async (newStudents) => {
+          if (onImportStudents) {
+            await onImportStudents(newStudents);
+          } else {
+            for (const s of newStudents) {
+              await onAddStudent(s);
+            }
+          }
+        }}
+      />
     </section>
   );
 };

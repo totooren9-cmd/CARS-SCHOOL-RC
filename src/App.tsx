@@ -35,6 +35,7 @@ import {
   clearAllScansInSupabase,
   subscribeToSupabaseRealtime,
   isSupabaseConnected,
+  syncPendingScans,
 } from './services/supabaseClient';
 
 function deduplicateAndFixScanIds(records: ScanRecord[]): ScanRecord[] {
@@ -259,6 +260,13 @@ export default function App() {
     if (isSupabaseConnected()) {
       refreshFromSupabase(true);
 
+      // Automatically sync any pending scans that were scanned offline or before connecting
+      syncPendingScans().then((syncRes) => {
+        if (syncRes.syncedCount > 0) {
+          showToast(`⚡ ซิงค์สแกนค้างส่งเข้า Supabase ${syncRes.syncedCount} รายการ สำเร็จ`);
+        }
+      });
+
       const unsubscribe = subscribeToSupabaseRealtime({
         onScanInsert: (newScan) => {
           setScans((prev) => {
@@ -421,19 +429,24 @@ export default function App() {
       }
 
       // 1. Auto-Sync to Supabase Real-time PostgreSQL 100%
-      if (isSupabaseConnected()) {
-        insertScanToSupabase(newScan)
-          .then((res) => {
-            if (res.success) {
-              console.log('✓ Inserted scan into Supabase database successfully');
-            } else {
-              console.warn('Supabase insert scan error:', res.error);
-            }
-          })
-          .catch((err) => {
-            console.warn('Background Supabase scan insert failed:', err);
-          });
-      }
+      insertScanToSupabase(newScan)
+        .then((res) => {
+          if (res.success) {
+            console.log('✓ Inserted scan into Supabase database successfully');
+            showToast(
+              isDropOff
+                ? `✓ ลงรถแล้ว & บันทึก Supabase สำเร็จ: ${student.name}`
+                : `✓ ขึ้นรถแล้ว & บันทึก Supabase สำเร็จ: ${student.name}`
+            );
+          } else {
+            console.warn('Supabase insert notice:', res.error);
+            showToast(`⚠️ บันทึกในเครื่องแล้ว (${res.error || 'รอต่อ Supabase'})`);
+          }
+        })
+        .catch((err) => {
+          console.warn('Background Supabase scan insert failed:', err);
+          showToast(`⚠️ บันทึกในเครื่องแล้ว (เก็บในคิวรอนำส่ง Supabase)`);
+        });
 
       // 2. Auto-Sync to Google Sheets & Apps Script
       if (autoSyncEnabled) {
@@ -604,6 +617,40 @@ export default function App() {
     }
   };
 
+  const handleImportStudents = async (importedStudents: Student[]) => {
+    if (importedStudents.length === 0) return;
+
+    setStudents((prev) => {
+      const existingMap = new Map<string, Student>();
+      prev.forEach((s) => existingMap.set(s.studentCode.trim().toUpperCase(), s));
+      importedStudents.forEach((s) => existingMap.set(s.studentCode.trim().toUpperCase(), s));
+      const merged = Array.from(existingMap.values());
+      try {
+        localStorage.setItem('bus_students', JSON.stringify(merged));
+      } catch (e) {
+        console.warn('Failed to persist imported students to localStorage:', e);
+      }
+      return merged;
+    });
+
+    showToast(`⚡ นำเข้าข้อมูลนักเรียน ${importedStudents.length} คน เรียบร้อย`);
+
+    if (isSupabaseConnected()) {
+      let successCount = 0;
+      for (const st of importedStudents) {
+        try {
+          const res = await insertStudentToSupabase(st);
+          if (res.success) successCount++;
+        } catch {
+          // ignore individual sync failure
+        }
+      }
+      if (successCount > 0) {
+        showToast(`⚡ ซิงค์ Supabase ${successCount}/${importedStudents.length} คน`);
+      }
+    }
+  };
+
   // ==========================================
   // SUPABASE CRUD HANDLERS: CARS
   // ==========================================
@@ -716,6 +763,10 @@ export default function App() {
             onSimulateScan={handleSimulateScan}
             activeScan={activeScan}
             totalScans={scans.length}
+            isSupabaseReady={isSupabaseConnected()}
+            onOpenSupabaseConfig={() => {
+              setIsAdminDashboardOpen(true);
+            }}
           />
 
           {/* Bottom : Scan List (Bottom Sheet) */}
@@ -744,6 +795,7 @@ export default function App() {
             onAddStudent={handleAddStudent}
             onEditStudent={handleEditStudent}
             onDeleteStudent={handleDeleteStudent}
+            onImportStudents={handleImportStudents}
             onAddCar={handleAddCar}
             onEditCar={handleEditCar}
             onDeleteCar={handleDeleteCar}

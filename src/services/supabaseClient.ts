@@ -75,6 +75,7 @@ export async function testSupabaseConnection(): Promise<{
   studentCount?: number;
   carCount?: number;
   scanCount?: number;
+  scansTableReady?: boolean;
 }> {
   const client = getSupabaseClient();
   if (!client) {
@@ -98,19 +99,40 @@ export async function testSupabaseConnection(): Promise<{
       };
     }
 
+    if (scanRes.error && scanRes.error.code === '42P01') {
+      return {
+        success: false,
+        message: 'เชื่อมต่อสำเร็จ แต่ยังไม่พบตาราง public.scans! ให้รันคำสั่ง SQL สร้างตาราง scans ใน Supabase ก่อน เพื่อบันทึกการสแกนได้จริง',
+        studentCount: stuRes.count || 0,
+        carCount: carRes.count || 0,
+        scansTableReady: false,
+      };
+    }
+
+    if (scanRes.error && (scanRes.error.code === '42501' || scanRes.error.message?.includes('policy'))) {
+      return {
+        success: false,
+        message: 'ตาราง public.scans ติดนโยบายความปลอดภัย RLS! กรุณาเพิ่ม Policy "Public scans access" ใน Supabase',
+        studentCount: stuRes.count || 0,
+        carCount: carRes.count || 0,
+        scansTableReady: false,
+      };
+    }
+
     if (stuRes.error) {
       return {
         success: false,
-        message: `ข้อผิดพลาด: ${stuRes.error.message}`,
+        message: `ข้อผิดพลาดตารางนักเรียน: ${stuRes.error.message}`,
       };
     }
 
     return {
       success: true,
-      message: 'เชื่อมต่อฐานข้อมูล Supabase สำเร็จ 100%!',
+      message: 'เชื่อมต่อฐานข้อมูล Supabase และตารางสแกนสำเร็จ 100%!',
       studentCount: stuRes.count || 0,
       carCount: carRes.count || 0,
       scanCount: scanRes.count || 0,
+      scansTableReady: true,
     };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -530,44 +552,199 @@ export async function fetchScansFromSupabase(): Promise<{ success: boolean; data
   }
 }
 
-// INSERT: Insert real-time Scan directly to Supabase
-export async function insertScanToSupabase(scan: ScanRecord): Promise<{ success: boolean; error?: string }> {
+// ==========================================
+// PENDING SCANS QUEUE (OFFLINE-FIRST / RECOVERY)
+// ==========================================
+const STORAGE_KEY_PENDING_SCANS = 'qr_bus_pending_scans';
+
+export function getPendingScans(): ScanRecord[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_PENDING_SCANS);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function savePendingScan(scan: ScanRecord): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const list = getPendingScans();
+    // avoid duplicates
+    const scanId = scan.scanId || scan.id;
+    if (!list.some((s) => (s.scanId || s.id) === scanId)) {
+      list.push(scan);
+      localStorage.setItem(STORAGE_KEY_PENDING_SCANS, JSON.stringify(list));
+    }
+  } catch (e) {
+    console.warn('Failed to save pending scan:', e);
+  }
+}
+
+export function removePendingScan(scanId: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const list = getPendingScans().filter((s) => (s.scanId || s.id) !== scanId);
+    localStorage.setItem(STORAGE_KEY_PENDING_SCANS, JSON.stringify(list));
+  } catch (e) {
+    console.warn('Failed to remove pending scan:', e);
+  }
+}
+
+export function clearPendingScans(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.removeItem(STORAGE_KEY_PENDING_SCANS);
+  } catch {
+    // ignore
+  }
+}
+
+// Sync all pending scans that were saved while offline or before connecting
+export async function syncPendingScans(): Promise<{ success: boolean; syncedCount: number; error?: string }> {
+  if (!isSupabaseConnected()) {
+    return { success: false, syncedCount: 0, error: 'Supabase ยังไม่ได้เชื่อมต่อ' };
+  }
+
+  const pending = getPendingScans();
+  if (pending.length === 0) {
+    return { success: true, syncedCount: 0 };
+  }
+
+  let successCount = 0;
+  for (const scan of pending) {
+    const res = await insertScanToSupabase(scan, { skipQueue: true });
+    if (res.success) {
+      removePendingScan(scan.scanId || scan.id);
+      successCount++;
+    }
+  }
+
+  return { success: true, syncedCount: successCount };
+}
+
+// INSERT: Insert real-time Scan directly to Supabase with auto-healing and fallback
+export async function insertScanToSupabase(
+  scan: ScanRecord,
+  options?: { skipQueue?: boolean }
+): Promise<{ success: boolean; error?: string }> {
   const client = getSupabaseClient();
   if (!client) {
-    return { success: false, error: 'Supabase not configured' };
+    if (!options?.skipQueue) {
+      savePendingScan(scan);
+    }
+    return { success: false, error: 'ยังไม่ได้ตั้งค่า Supabase URL และ Anon Key' };
   }
 
   try {
-    const todayStr = new Date().toISOString().split('T')[0];
-    const timeStr = new Date().toTimeString().split(' ')[0];
+    // Calculate reliable ISO Date (YYYY-MM-DD) and 24-hour Time (HH:MM:SS)
+    const ts = scan.timestamp || Date.now();
+    const d = new Date(ts);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const scanDate = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const scanTime = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 
-    const payload = {
-      scan_id: scan.scanId || scan.id || `SCN${Date.now()}`,
-      scan_date: scan.dateThai?.includes('-') ? scan.dateThai : todayStr,
-      scan_time: scan.timeThai?.replace(' น.', '') || timeStr,
-      student_id: scan.studentCode || scan.studentId,
-      student_name: scan.name,
-      car_id: scan.carID || scan.busNumber || 'CAR01',
-      plate_number: scan.plate || '1กข 1234',
+    const scanId = (scan.scanId || scan.id || `SCN${Date.now()}`).trim();
+    const studentId = (scan.studentCode || scan.studentId || '').trim();
+    const carId = (scan.carID || scan.busNumber || 'CAR01').trim();
+    const studentName = (scan.name || 'นักเรียน').trim();
+    const plateNumber = (scan.plate || '1กข 1234').trim();
+
+    const payload: Record<string, unknown> = {
+      scan_id: scanId,
+      scan_date: scanDate,
+      scan_time: scanTime,
+      student_id: studentId || null,
+      student_name: studentName,
+      car_id: carId || null,
+      plate_number: plateNumber,
       dorm: scan.dorm || scan.locationName || 'จุดรับส่ง',
       scan_type: scan.scanType || 'ขึ้นรถ',
       scanner_by: scan.scannerName || 'เจ้าหน้าที่',
       scanner_device: scan.device || 'MOBILE01',
       scan_result: 'สำเร็จ',
       note: scan.note || '',
-      latitude: scan.latitude || 13.7548,
-      longitude: scan.longitude || 100.4982,
+      latitude: typeof scan.latitude === 'number' ? scan.latitude : 13.7548,
+      longitude: typeof scan.longitude === 'number' ? scan.longitude : 100.4982,
     };
 
-    const { error } = await client.from('scans').insert(payload);
-    if (error) {
-      console.error('Failed to insert scan into Supabase:', error);
-      return { success: false, error: error.message };
+    // Use upsert on scan_id to prevent duplicate key crashes
+    let { error } = await client.from('scans').upsert(payload, { onConflict: 'scan_id' });
+
+    // Handle Foreign Key Constraint Violations (error code 23503)
+    if (error && (error.code === '23503' || error.message?.includes('foreign key constraint'))) {
+      console.warn('Foreign key violation encountered, applying self-healing:', error.message);
+
+      // 1. If student_id caused the foreign key violation
+      if (error.message?.includes('scans_student_id_fkey') || error.message?.includes('student_id')) {
+        if (studentId) {
+          // Attempt to auto-create stub student record
+          await client.from('students').upsert(
+            {
+              student_id: studentId,
+              qr_code: studentId,
+              name: studentName,
+              status: 'ใช้งาน',
+            },
+            { onConflict: 'student_id' }
+          );
+        }
+      }
+
+      // 2. If car_id caused the foreign key violation
+      if (error.message?.includes('scans_car_id_fkey') || error.message?.includes('car_id')) {
+        if (carId) {
+          // Attempt to auto-create stub car record
+          await client.from('cars').upsert(
+            {
+              car_id: carId,
+              plate_number: plateNumber,
+              name: carId,
+              status: 'ใช้งาน',
+            },
+            { onConflict: 'car_id' }
+          );
+        }
+      }
+
+      // Retry upsert
+      const retryResult = await client.from('scans').upsert(payload, { onConflict: 'scan_id' });
+      error = retryResult.error;
+
+      // If still failing foreign key, nullify foreign keys so the scan is NEVER discarded!
+      if (error && (error.code === '23503' || error.message?.includes('foreign key'))) {
+        payload.student_id = null;
+        payload.car_id = null;
+        const lastChance = await client.from('scans').upsert(payload, { onConflict: 'scan_id' });
+        error = lastChance.error;
+      }
     }
 
+    if (error) {
+      console.error('Failed to insert scan into Supabase:', error);
+      if (!options?.skipQueue) {
+        savePendingScan(scan);
+      }
+
+      let friendlyMsg = error.message;
+      if (error.code === '42P01') {
+        friendlyMsg = 'ไม่พบตาราง public.scans ในฐานข้อมูล Supabase! กรุณารันคำสั่ง SQL สร้างตาราง scans';
+      } else if (error.code === '42501' || error.message?.includes('row-level security') || error.message?.includes('policy')) {
+        friendlyMsg = 'ติดสิทธิ์ความปลอดภัย RLS ของตาราง scans ใน Supabase! กรุณาเพิ่มนโยบายอนุญาตบันทึก';
+      }
+
+      return { success: false, error: friendlyMsg };
+    }
+
+    // Success: remove from pending queue if was queued
+    removePendingScan(scanId);
     return { success: true };
   } catch (err: unknown) {
     console.error('Error inserting scan to Supabase:', err);
+    if (!options?.skipQueue) {
+      savePendingScan(scan);
+    }
     const msg = err instanceof Error ? err.message : String(err);
     return { success: false, error: msg };
   }

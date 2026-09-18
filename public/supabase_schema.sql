@@ -42,14 +42,14 @@ CREATE TABLE IF NOT EXISTS public.students (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 3. สร้างตาราง: scans (บันทึกการสแกน 03_บันทึกการสแกน)
+-- 3. สร้างตาราง: scans (บันทึกการสแกน 03_บันทึกการสแกน - ออกแบบให้สแกนได้ลื่นไหล ไม่ติด Foreign Key)
 CREATE TABLE IF NOT EXISTS public.scans (
     scan_id TEXT PRIMARY KEY,
     scan_date DATE NOT NULL,
     scan_time TIME NOT NULL,
-    student_id TEXT REFERENCES public.students(student_id) ON DELETE CASCADE,
+    student_id TEXT, -- อนุญาตบันทึกได้ทันทีแม้นักเรียนยังไม่ได้เพิ่มในฐานข้อมูล
     student_name TEXT,
-    car_id TEXT REFERENCES public.cars(car_id) ON DELETE SET NULL,
+    car_id TEXT,    -- อนุญาตบันทึกได้ทันทีแม้ยังไม่มีรหัสรถในฐานข้อมูล
     plate_number TEXT,
     dorm TEXT,
     scan_type TEXT NOT NULL DEFAULT 'ขึ้นรถ', -- 'ขึ้นรถ' หรือ 'ลงรถ'
@@ -61,6 +61,10 @@ CREATE TABLE IF NOT EXISTS public.scans (
     longitude NUMERIC(10, 7),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- ปลดล็อก Foreign Key หากเคยสร้างไว้ เพื่อให้บันทึกสแกนได้ทันทีโดยไม่ติด constraint
+ALTER TABLE public.scans DROP CONSTRAINT IF EXISTS scans_student_id_fkey;
+ALTER TABLE public.scans DROP CONSTRAINT IF EXISTS scans_car_id_fkey;
 
 -- 4. สร้างตาราง: users (ผู้ใช้งาน 04_ผู้ใช้งาน)
 CREATE TABLE IF NOT EXISTS public.users (

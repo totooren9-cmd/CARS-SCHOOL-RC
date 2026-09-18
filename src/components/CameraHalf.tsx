@@ -7,6 +7,8 @@ interface CameraHalfProps {
   onSimulateScan: () => void;
   activeScan: ScanRecord | null;
   totalScans: number;
+  isSupabaseReady?: boolean;
+  onOpenSupabaseConfig?: () => void;
 }
 
 export const CameraHalf: React.FC<CameraHalfProps> = ({
@@ -14,6 +16,8 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
   onSimulateScan,
   activeScan,
   totalScans,
+  isSupabaseReady = false,
+  onOpenSupabaseConfig,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -202,12 +206,34 @@ export const CameraHalf: React.FC<CameraHalfProps> = ({
 
   return (
     <div className="camera-half">
-      {/* Dynamic Island */}
-      <div className="dynamic-island">
-        <span className="di-dot"></span>
-        <span className="di-text">
-          {activeScan ? `✓ ${activeScan.name} (${activeScan.grade})` : `QR SCAN • ${totalScans} คน`}
-        </span>
+      {/* Dynamic Island & Cloud Status */}
+      <div className="flex flex-col items-center gap-1.5 z-20 pointer-events-auto">
+        <div className="dynamic-island">
+          <span className="di-dot"></span>
+          <span className="di-text">
+            {activeScan ? `✓ ${activeScan.name} (${activeScan.grade})` : `QR SCAN • ${totalScans} คน`}
+          </span>
+        </div>
+
+        {onOpenSupabaseConfig && (
+          <button
+            type="button"
+            onClick={onOpenSupabaseConfig}
+            className={`px-2.5 py-0.5 rounded-full text-[10px] font-medium flex items-center gap-1.5 backdrop-blur-md transition-all shadow-sm ${
+              isSupabaseReady
+                ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-900/80'
+                : 'bg-amber-950/80 text-amber-300 border border-amber-500/40 hover:bg-amber-900/80 animate-pulse'
+            }`}
+            title={isSupabaseReady ? 'Supabase เชื่อมต่อพร้อมบันทึกอัตโนมัติ' : 'คลิกเพื่อตั้งค่า Supabase'}
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                isSupabaseReady ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
+              }`}
+            />
+            <span>{isSupabaseReady ? 'Supabase Cloud: บันทึกอัตโนมัติ' : 'Supabase: ยังไม่เชื่อมต่อ (แตะตั้งค่า)'}</span>
+          </button>
+        )}
       </div>
 
       <div id="cameraStage" className="camera-stage">
